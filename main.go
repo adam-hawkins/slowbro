@@ -6,6 +6,8 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"os"
+	"os/exec"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -52,14 +54,15 @@ func formHandler(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal(body, &form)
 		sess := establishSession(form.Profile, form.Region)
 		instance := checkDBInstance(sess, form.Instance)
-		fmt.Println(instance.parameterGroupName)
 		if defaultParameterGroups[instance.parameterGroupName] {
-			fmt.Println("gotta create")
 			createParameterGroup(sess, instance)
 			time.Sleep(6000) //TODO: add better checking, don't just wait a long time
 			attachParameterGroup(sess, instance.name)
 		}
-		toggleSlowQueryLog(sess, instance.parameterGroupName)
+		toggleSlowQueryLog(sess, instance.parameterGroupName, "true")
+		filename := downloadSlowQueryLog(sess, instance.name)
+		downloadQueryDigest()
+		runQueryDigest(filename, instance.name)
 
 	} else {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -69,7 +72,6 @@ func formHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func establishSession(profile, region string) *rds.RDS {
-	fmt.Println("setting region to", region)
 	sess, err := session.NewSessionWithOptions(session.Options{
 		// Specify profile to load for the session's config
 		Profile: profile,
@@ -153,7 +155,7 @@ func attachParameterGroup(sess *rds.RDS, instanceName string) {
 		DBParameterGroupName: aws.String("slowbro-slowquery"),
 	}
 
-	result, err := sess.ModifyDBInstance(input)
+	_, err := sess.ModifyDBInstance(input)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
 			switch aerr.Code() {
@@ -205,7 +207,6 @@ func attachParameterGroup(sess *rds.RDS, instanceName string) {
 		}
 		return
 	}
-	fmt.Println(result)
 }
 
 func toggleSlowQueryLog(sess *rds.RDS, parameterGroup, parameterValue string) error {
@@ -216,6 +217,11 @@ func toggleSlowQueryLog(sess *rds.RDS, parameterGroup, parameterValue string) er
 				ApplyMethod:    aws.String("immediate"),
 				ParameterName:  aws.String("slow_query_log"),
 				ParameterValue: aws.String(parameterValue),
+			},
+			{
+				ApplyMethod:    aws.String("immediate"),
+				ParameterName:  aws.String("long_query_time"),
+				ParameterValue: aws.String("0"),
 			},
 		},
 	}
@@ -241,15 +247,57 @@ func toggleSlowQueryLog(sess *rds.RDS, parameterGroup, parameterValue string) er
 	return nil
 }
 
-func downloadSlowQueryLog(sess *rds.RDS) {
+func downloadSlowQueryLog(sess *rds.RDS, instanceName string) string {
+	input := &rds.DownloadDBLogFilePortionInput{
+		DBInstanceIdentifier: aws.String(instanceName),
+		LogFileName:          aws.String("slowquery/mysql-slowquery.log"),
+	}
 
-}
-func checkForQueryDigest() {
+	result, err := sess.DownloadDBLogFilePortion(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case rds.ErrCodeDBInstanceNotFoundFault:
+				fmt.Println(rds.ErrCodeDBInstanceNotFoundFault, aerr.Error())
+			case rds.ErrCodeDBLogFileNotFoundFault:
+				fmt.Println(rds.ErrCodeDBLogFileNotFoundFault, aerr.Error())
+			default:
+				fmt.Println(aerr.Error())
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+		}
+	}
 
+	filename := instanceName + "-slowquery-" + time.Now().String()
+	f, err := os.Create(filename)
+	if err != nil {
+		fmt.Println(err)
+		f.Close()
+	}
+
+	f.WriteString(*result.LogFileData)
+	os.Chmod("./pt-query-digest", 777)
+	return filename
 }
+
 func downloadQueryDigest() {
-
+	f, _ := os.Create("pt-query-digest")
+	resp, _ := http.Get("https://www.percona.com/get/pt-query-digest")
+	_, _ = io.Copy(f, resp.Body)
+	os.Chmod("pt-query-digest", 777)
 }
-func runQueryDigest() {
-
+func runQueryDigest(filename, instanceName string) {
+	binary, lookErr := exec.LookPath("perl")
+	if lookErr != nil {
+		panic(lookErr)
+	}
+	runDigest := exec.Command(binary, "pt-query-digest", "<", filename)
+	slowLogBytes, _ := runDigest.Output()
+	slowLog := string(slowLogBytes)
+	outputFilename := instanceName + "-" + time.Now().String() + "-digested"
+	outputFile, _ := os.Create(outputFilename)
+	outputFile.WriteString(slowLog)
 }
