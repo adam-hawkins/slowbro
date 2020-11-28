@@ -62,11 +62,12 @@ func formHandler(w http.ResponseWriter, r *http.Request) {
 		toggleSlowQueryLog(sess, instance.parameterGroupName, "true")
 		filename := downloadSlowQueryLog(sess, instance.name)
 		downloadQueryDigest()
-		runQueryDigest(filename, instance.name)
-
+		digest := runQueryDigest(filename, instance.name)
+		w.Write([]byte(digest))
+		json.NewEncoder(w).Encode(form)
 	} else {
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		io.WriteString(w, "Forbidden\n")
+		fmt.Fprintf(w, "Forbidden\n")
 	}
 
 }
@@ -223,6 +224,11 @@ func toggleSlowQueryLog(sess *rds.RDS, parameterGroup, parameterValue string) er
 				ParameterName:  aws.String("long_query_time"),
 				ParameterValue: aws.String("0"),
 			},
+			{
+				ApplyMethod:    aws.String("immediate"),
+				ParameterName:  aws.String("log_output"),
+				ParameterValue: aws.String("FILE"),
+			},
 		},
 	}
 
@@ -289,7 +295,7 @@ func downloadQueryDigest() {
 	_, _ = io.Copy(f, resp.Body)
 	os.Chmod("pt-query-digest", 777)
 }
-func runQueryDigest(filename, instanceName string) {
+func runQueryDigest(filename, instanceName string) string {
 	binary, lookErr := exec.LookPath("perl")
 	if lookErr != nil {
 		panic(lookErr)
@@ -300,4 +306,5 @@ func runQueryDigest(filename, instanceName string) {
 	outputFilename := instanceName + "-" + time.Now().String() + "-digested"
 	outputFile, _ := os.Create(outputFilename)
 	outputFile.WriteString(slowLog)
+	return slowLog
 }
