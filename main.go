@@ -22,13 +22,18 @@ type DBInstance struct {
 	engineVersion        string
 	parameterGroupName   string
 	parameterGroupFamily string
+	status               string
+	parameterGroupStatus string
 }
 
 type TuneForm struct {
-	Instance    string `json:"identifier"`
-	Profile     string `json:"profile"`
-	Region      string `json:"region"`
-	TimerLength uint8  `json:"sampleTime"`
+	Instance      string `json:"identifier"`
+	Profile       string `json:"profile"`
+	Region        string `json:"region"`
+	SlowQueryOn   string `json:"slowQueryToggle"`
+	LogType       string `json:"logType"`
+	TimerLength   int    `json:"sampleTime"`
+	LongQueryTime string `json:"longQueryTime"`
 }
 
 func main() {
@@ -54,24 +59,85 @@ func formHandler(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal(body, &form)
 		sess := establishSession(form.Profile, form.Region)
 		instance := checkDBInstance(sess, form.Instance)
+		defaultUsed := false
+		defaultGroup := ""
 		if defaultParameterGroups[instance.parameterGroupName] {
-			createParameterGroup(sess, instance)
-			time.Sleep(6000) //TODO: add better checking, don't just wait a long time
-			attachParameterGroup(sess, instance.name)
+			fmt.Println("using a default parameter group")
+			defaultUsed = true
+			defaultGroup = instance.parameterGroupName
+			createParameterGroup(sess, instance.parameterGroupFamily)
+			time.Sleep(5 * time.Second) //TODO: add better checking, don't just wait a long time
+			fmt.Println("attaching new parameter group")
+			attachParameterGroup(sess, instance.name, "slowbro-slowquery")
+			time.Sleep(5 * time.Second)
+			instance = checkDBInstance(sess, form.Instance)
+			waitOnApply(sess, instance)
+			instance.parameterGroupName = "slowbro-slowquery"
 		}
-		toggleSlowQueryLog(sess, instance.parameterGroupName, "true")
+
+		//toggle log off to force a cycle into a new log
+		fmt.Println("cycling the old slow query log")
+		setSlowQuerySettings(sess, instance.parameterGroupName, form.LongQueryTime, "false", form.LogType)
+		time.Sleep(5 * time.Second)
+		waitOnApply(sess, instance)
+		fmt.Println("turning slow log on")
+		setSlowQuerySettings(sess, instance.parameterGroupName, "0", "true", "FILE")
+		time.Sleep(5 * time.Second)
+		waitOnApply(sess, instance)
+		fmt.Printf("slow log applied resting for %d seconds\n", form.TimerLength)
+		time.Sleep(time.Duration(form.TimerLength) * time.Second)
+		fmt.Println("downloading the resulting log")
 		filename := downloadSlowQueryLog(sess, instance.name)
 		downloadQueryDigest()
 		digest := runQueryDigest(filename, instance.name)
-		w.Write([]byte(digest))
-		json.NewEncoder(w).Encode(form)
+		_, _ = w.Write([]byte(digest))
+
+		if defaultUsed {
+			fmt.Println("reverting back to default group", defaultGroup)
+			attachParameterGroup(sess, instance.name, defaultGroup)
+			waitOnApply(sess, instance)
+			deleteSlowBroGroup(sess)
+		} else {
+			fmt.Println("reverting back to configured settings")
+			setSlowQuerySettings(sess, instance.parameterGroupName, form.LongQueryTime, form.SlowQueryOn, form.LogType)
+		}
 	} else {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		fmt.Fprintf(w, "Forbidden\n")
 	}
-
+	fmt.Println("ready for more")
+}
+func waitOnApply(sess *rds.RDS, instance *DBInstance) {
+	for instance.status == "modifying" || instance.parameterGroupStatus == "applying" {
+		instance = checkDBInstance(sess, instance.name)
+		time.Sleep(2 * time.Second)
+	}
 }
 
+func deleteSlowBroGroup(sess *rds.RDS) {
+	input := &rds.DeleteDBParameterGroupInput{
+		DBParameterGroupName: aws.String("slowbro-slowquery"),
+	}
+
+	_, err := sess.DeleteDBParameterGroup(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case rds.ErrCodeInvalidDBParameterGroupStateFault:
+				fmt.Println(rds.ErrCodeInvalidDBParameterGroupStateFault, aerr.Error())
+			case rds.ErrCodeDBParameterGroupNotFoundFault:
+				fmt.Println(rds.ErrCodeDBParameterGroupNotFoundFault, aerr.Error())
+			default:
+				fmt.Println(aerr.Error())
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+		}
+		return
+	}
+}
 func establishSession(profile, region string) *rds.RDS {
 	sess, err := session.NewSessionWithOptions(session.Options{
 		// Specify profile to load for the session's config
@@ -92,7 +158,7 @@ func establishSession(profile, region string) *rds.RDS {
 
 func checkDBInstance(sess *rds.RDS, db_identifier string) *DBInstance {
 	input := &rds.DescribeDBInstancesInput{
-		DBInstanceIdentifier: aws.String(db_identifier), //parameratize this
+		DBInstanceIdentifier: aws.String(db_identifier),
 	}
 
 	result, err := sess.DescribeDBInstances(input)
@@ -117,13 +183,15 @@ func checkDBInstance(sess *rds.RDS, db_identifier string) *DBInstance {
 		engineVersion:        *foundInstance.EngineVersion,
 		parameterGroupName:   *foundInstance.DBParameterGroups[0].DBParameterGroupName,
 		parameterGroupFamily: *foundInstance.Engine + (*foundInstance.EngineVersion)[0:3],
+		status:               *foundInstance.DBInstanceStatus,
+		parameterGroupStatus: *foundInstance.DBParameterGroups[0].ParameterApplyStatus,
 	}
 	return &dbInstance
 }
 
-func createParameterGroup(sess *rds.RDS, dbInstance *DBInstance) error {
+func createParameterGroup(sess *rds.RDS, parameterGroupFamily string) error {
 	input := &rds.CreateDBParameterGroupInput{
-		DBParameterGroupFamily: aws.String(dbInstance.parameterGroupFamily),
+		DBParameterGroupFamily: aws.String(parameterGroupFamily),
 		DBParameterGroupName:   aws.String("slowbro-slowquery"),
 		Description:            aws.String("Keep most defaults, but enable the slow query log"),
 	}
@@ -146,14 +214,13 @@ func createParameterGroup(sess *rds.RDS, dbInstance *DBInstance) error {
 		}
 		return err
 	}
-	dbInstance.parameterGroupName = "slowbro-slowquery"
 	return nil
 }
 
-func attachParameterGroup(sess *rds.RDS, instanceName string) {
+func attachParameterGroup(sess *rds.RDS, instanceName, parameterGroupName string) {
 	input := &rds.ModifyDBInstanceInput{
 		DBInstanceIdentifier: aws.String(instanceName),
-		DBParameterGroupName: aws.String("slowbro-slowquery"),
+		DBParameterGroupName: aws.String(parameterGroupName),
 	}
 
 	_, err := sess.ModifyDBInstance(input)
@@ -210,7 +277,7 @@ func attachParameterGroup(sess *rds.RDS, instanceName string) {
 	}
 }
 
-func toggleSlowQueryLog(sess *rds.RDS, parameterGroup, parameterValue string) error {
+func setSlowQuerySettings(sess *rds.RDS, parameterGroup, longQueryTime, parameterValue, logOutputType string) error {
 	modifyInput := &rds.ModifyDBParameterGroupInput{
 		DBParameterGroupName: aws.String(parameterGroup),
 		Parameters: []*rds.Parameter{
@@ -222,12 +289,12 @@ func toggleSlowQueryLog(sess *rds.RDS, parameterGroup, parameterValue string) er
 			{
 				ApplyMethod:    aws.String("immediate"),
 				ParameterName:  aws.String("long_query_time"),
-				ParameterValue: aws.String("0"),
+				ParameterValue: aws.String(longQueryTime),
 			},
 			{
 				ApplyMethod:    aws.String("immediate"),
 				ParameterName:  aws.String("log_output"),
-				ParameterValue: aws.String("FILE"),
+				ParameterValue: aws.String(logOutputType),
 			},
 		},
 	}
@@ -295,6 +362,7 @@ func downloadQueryDigest() {
 	_, _ = io.Copy(f, resp.Body)
 	os.Chmod("pt-query-digest", 777)
 }
+
 func runQueryDigest(filename, instanceName string) string {
 	binary, lookErr := exec.LookPath("perl")
 	if lookErr != nil {
